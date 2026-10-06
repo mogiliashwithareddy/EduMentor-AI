@@ -1,7 +1,14 @@
+import hashlib
 import uuid
-import chromadb
 
-from sentence_transformers import SentenceTransformer
+import chromadb
+import streamlit as st
+
+from pypdf import PdfReader
+
+from sentence_transformers import (
+    SentenceTransformer
+)
 
 from config import (
     CHROMA_DIR,
@@ -9,168 +16,535 @@ from config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     TOP_K,
-    OLLAMA_MODEL,
+    OLLAMA_MODEL
 )
 
-from modules.document_processor import (
-    extract_pdf_pages,
-    create_chunks,
+from modules.llm_utils import (
+    ask_ollama
 )
 
-from modules.llm_utils import ask_ollama
 
+# =========================================================
+# EMBEDDING MODEL
+# =========================================================
 
-_embedding_model = None
-
-
+@st.cache_resource
 def get_embedding_model():
-    global _embedding_model
 
-    if _embedding_model is None:
-        _embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL
-        )
-
-    return _embedding_model
+    return SentenceTransformer(
+        EMBEDDING_MODEL
+    )
 
 
-def get_client():
+# =========================================================
+# PERSISTENT CHROMADB
+# =========================================================
+
+@st.cache_resource
+def get_chroma_client():
+
     return chromadb.PersistentClient(
         path=str(CHROMA_DIR)
     )
 
 
+# =========================================================
+# COLLECTION
+# =========================================================
+
 def get_collection():
-    client = get_client()
+
+    client = get_chroma_client()
 
     return client.get_or_create_collection(
-        name="study_materials"
+        name="edumentor_documents"
     )
 
 
-def clear_database():
-    client = get_client()
+# =========================================================
+# FILE HASH
+# =========================================================
 
-    try:
-        client.delete_collection(
-            name="study_materials"
-        )
-    except Exception:
-        pass
+def get_file_hash(uploaded_file):
 
-    return client.get_or_create_collection(
-        name="study_materials"
+    file_bytes = uploaded_file.getvalue()
+
+    return hashlib.sha256(
+        file_bytes
+    ).hexdigest()
+
+
+# =========================================================
+# EXTRACT PDF PAGES
+# =========================================================
+
+def extract_pdf_pages(
+    uploaded_file
+):
+
+    uploaded_file.seek(0)
+
+    reader = PdfReader(
+        uploaded_file
     )
 
+    pages = []
 
-def process_uploaded_files(uploaded_files):
-    collection = clear_database()
-    embedding_model = get_embedding_model()
+    for page_number, page in enumerate(
+        reader.pages,
+        start=1
+    ):
 
-    all_chunks = []
+        text = page.extract_text()
+
+        if text and text.strip():
+
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": text.strip()
+                }
+            )
+
+    return pages
+
+
+# =========================================================
+# CREATE CHUNKS
+# =========================================================
+
+def create_chunks(
+    pages,
+    source,
+    file_hash
+):
+
+    chunks = []
+
+    step = max(
+        CHUNK_SIZE - CHUNK_OVERLAP,
+        1
+    )
+
+    chunk_number = 0
+
+    for page in pages:
+
+        text = page["text"]
+
+        start = 0
+
+        while start < len(text):
+
+            end = (
+                start + CHUNK_SIZE
+            )
+
+            chunk_text = text[
+                start:end
+            ].strip()
+
+            if chunk_text:
+
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "source": source,
+                        "page": page["page"],
+                        "chunk": chunk_number,
+                        "file_hash": file_hash
+                    }
+                )
+
+                chunk_number += 1
+
+            start += step
+
+    return chunks
+
+
+# =========================================================
+# CHECK DUPLICATE
+# =========================================================
+
+def document_already_exists(
+    file_hash
+):
+
+    collection = get_collection()
+
+    result = collection.get(
+        where={
+            "file_hash": file_hash
+        }
+    )
+
+    ids = result.get(
+        "ids",
+        []
+    )
+
+    return bool(ids)
+
+
+# =========================================================
+# PROCESS UPLOADED FILES
+# =========================================================
+
+def process_uploaded_files(
+    uploaded_files
+):
+
+    collection = get_collection()
+
+    embedding_model = (
+        get_embedding_model()
+    )
+
     processed_files = []
 
+    total_chunks = 0
+
     for uploaded_file in uploaded_files:
-        pages = extract_pdf_pages(uploaded_file)
+
+        file_hash = get_file_hash(
+            uploaded_file
+        )
+
+
+        # ---------------------------------
+        # ALREADY SAVED
+        # ---------------------------------
+
+        if document_already_exists(
+            file_hash
+        ):
+
+            processed_files.append(
+                {
+                    "name": uploaded_file.name,
+                    "pages": 0,
+                    "status": "Already processed"
+                }
+            )
+
+            continue
+
+
+        # ---------------------------------
+        # EXTRACT PDF
+        # ---------------------------------
+
+        pages = extract_pdf_pages(
+            uploaded_file
+        )
 
         if not pages:
+
+            processed_files.append(
+                {
+                    "name": uploaded_file.name,
+                    "pages": 0,
+                    "status": "No readable text"
+                }
+            )
+
             continue
+
+
+        # ---------------------------------
+        # CHUNK TEXT
+        # ---------------------------------
 
         chunks = create_chunks(
             pages=pages,
             source=uploaded_file.name,
-            chunk_size=CHUNK_SIZE,
-            overlap=CHUNK_OVERLAP
+            file_hash=file_hash
         )
 
-        all_chunks.extend(chunks)
+        if not chunks:
 
-        processed_files.append({
-            "name": uploaded_file.name,
-            "pages": len(pages),
-            "chunks": len(chunks)
-        })
+            continue
 
-    if not all_chunks:
-        return processed_files, 0
 
-    texts = [
-        chunk["text"]
-        for chunk in all_chunks
-    ]
+        texts = [
+            chunk["text"]
+            for chunk in chunks
+        ]
 
-    embeddings = embedding_model.encode(
-        texts,
-        show_progress_bar=False
+
+        # ---------------------------------
+        # EMBEDDINGS
+        # ---------------------------------
+
+        embeddings = (
+            embedding_model.encode(
+                texts,
+                show_progress_bar=False
+            )
+        )
+
+
+        ids = [
+            uuid.uuid4().hex
+            for _ in chunks
+        ]
+
+
+        metadatas = []
+
+        for chunk in chunks:
+
+            metadatas.append(
+                {
+                    "source": (
+                        chunk["source"]
+                    ),
+                    "page": int(
+                        chunk["page"]
+                    ),
+                    "chunk": int(
+                        chunk["chunk"]
+                    ),
+                    "file_hash": (
+                        chunk["file_hash"]
+                    )
+                }
+            )
+
+
+        # ---------------------------------
+        # SAVE TO CHROMA
+        # ---------------------------------
+
+        collection.add(
+            ids=ids,
+            documents=texts,
+            embeddings=embeddings.tolist(),
+            metadatas=metadatas
+        )
+
+
+        total_chunks += len(
+            chunks
+        )
+
+
+        processed_files.append(
+            {
+                "name": uploaded_file.name,
+                "pages": len(pages),
+                "status": "Processed"
+            }
+        )
+
+
+    return (
+        processed_files,
+        total_chunks
     )
 
-    ids = [
-        str(uuid.uuid4())
-        for _ in all_chunks
-    ]
 
-    metadatas = [
-        {
-            "source": chunk["source"],
-            "page": chunk["page"],
-            "chunk": chunk["chunk"]
-        }
-        for chunk in all_chunks
-    ]
-
-    collection.add(
-        ids=ids,
-        documents=texts,
-        embeddings=embeddings.tolist(),
-        metadatas=metadatas
-    )
-
-    return processed_files, len(all_chunks)
-
+# =========================================================
+# DOCUMENT NAMES
+# =========================================================
 
 def get_document_names():
+
     collection = get_collection()
 
-    if collection.count() == 0:
-        return []
-
-    results = collection.get(
-        include=["metadatas"]
+    result = collection.get(
+        include=[
+            "metadatas"
+        ]
     )
 
     names = set()
 
-    for metadata in results["metadatas"]:
-        if metadata:
-            names.add(
-                metadata.get(
-                    "source",
-                    "Unknown"
-                )
-            )
+    for metadata in result.get(
+        "metadatas",
+        []
+    ):
+
+        if not metadata:
+            continue
+
+        source = metadata.get(
+            "source"
+        )
+
+        if source:
+            names.add(source)
 
     return sorted(names)
 
 
-def retrieve_chunks(question, top_k=TOP_K, selected_source=None):
+# =========================================================
+# GET DOCUMENT CONTEXT
+# Used by Summary / Quiz / Flashcards etc.
+# =========================================================
+
+def get_context_for_source(
+    source,
+    max_chars=18000
+):
+
     collection = get_collection()
 
-    count = collection.count()
+    if collection.count() == 0:
+        return ""
 
-    if count == 0:
+
+    if source == "No Documents":
+
+        return ""
+
+
+    if source == "All Documents":
+
+        result = collection.get(
+            include=[
+                "documents",
+                "metadatas"
+            ]
+        )
+
+    else:
+
+        result = collection.get(
+            where={
+                "source": source
+            },
+            include=[
+                "documents",
+                "metadatas"
+            ]
+        )
+
+
+    documents = result.get(
+        "documents",
+        []
+    )
+
+    metadatas = result.get(
+        "metadatas",
+        []
+    )
+
+
+    if not documents:
+        return ""
+
+
+    # Sort chunks by document / page / chunk
+
+    combined = list(
+        zip(
+            documents,
+            metadatas
+        )
+    )
+
+    combined.sort(
+        key=lambda item: (
+            item[1].get(
+                "source",
+                ""
+            ),
+            item[1].get(
+                "page",
+                0
+            ),
+            item[1].get(
+                "chunk",
+                0
+            )
+        )
+    )
+
+
+    context_parts = []
+
+    current_length = 0
+
+    for document, metadata in combined:
+
+        source_name = metadata.get(
+            "source",
+            "Unknown"
+        )
+
+        page = metadata.get(
+            "page",
+            0
+        )
+
+        part = (
+            f"\nDocument: {source_name}\n"
+            f"Page: {page}\n"
+            f"{document}\n"
+        )
+
+
+        if (
+            current_length
+            + len(part)
+            > max_chars
+        ):
+            break
+
+
+        context_parts.append(
+            part
+        )
+
+        current_length += len(
+            part
+        )
+
+
+    return "\n".join(
+        context_parts
+    )
+
+
+# =========================================================
+# RETRIEVE RELEVANT CHUNKS
+# =========================================================
+
+def retrieve_chunks(
+    question,
+    selected_source="All Documents"
+):
+
+    collection = get_collection()
+
+    if collection.count() == 0:
+
         return []
 
-    embedding_model = get_embedding_model()
 
-    question_embedding = embedding_model.encode(
-        question
+    embedding_model = (
+        get_embedding_model()
     )
+
+
+    query_embedding = (
+        embedding_model.encode(
+            question
+        )
+    )
+
 
     query_args = {
         "query_embeddings": [
-            question_embedding.tolist()
+            query_embedding.tolist()
         ],
-        "n_results": min(top_k, count),
+        "n_results": min(
+            TOP_K,
+            collection.count()
+        ),
         "include": [
             "documents",
             "metadatas",
@@ -178,161 +552,200 @@ def retrieve_chunks(question, top_k=TOP_K, selected_source=None):
         ]
     }
 
-    if selected_source and selected_source != "All Documents":
+
+    if (
+        selected_source
+        and
+        selected_source
+        not in [
+            "All Documents",
+            "No Documents"
+        ]
+    ):
+
         query_args["where"] = {
             "source": selected_source
         }
 
-    results = collection.query(
+
+    result = collection.query(
         **query_args
     )
 
-    retrieved = []
 
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-    distances = results["distances"][0]
+    if not result.get(
+        "documents"
+    ):
 
-    for document, metadata, distance in zip(
+        return []
+
+
+    if not result[
+        "documents"
+    ][0]:
+
+        return []
+
+
+    chunks = []
+
+
+    documents = (
+        result["documents"][0]
+    )
+
+    metadatas = (
+        result["metadatas"][0]
+    )
+
+    distances = (
+        result["distances"][0]
+    )
+
+
+    for (
+        document,
+        metadata,
+        distance
+    ) in zip(
         documents,
         metadatas,
         distances
     ):
-        retrieved.append({
-            "text": document,
-            "source": metadata.get("source", "Unknown"),
-            "page": metadata.get("page", "?"),
-            "distance": distance
-        })
 
-    return retrieved
+        chunks.append(
+            {
+                "text": document,
+                "source": metadata.get(
+                    "source",
+                    "Unknown"
+                ),
+                "page": int(
+                    metadata.get(
+                        "page",
+                        0
+                    )
+                ),
+                "distance": distance
+            }
+        )
 
+
+    return chunks
+
+
+# =========================================================
+# ANSWER QUESTION
+# =========================================================
 
 def answer_question(
     question,
-    selected_source=None,
+    selected_source="All Documents",
     model=OLLAMA_MODEL,
     chat_history=None
 ):
+
     chunks = retrieve_chunks(
         question=question,
         selected_source=selected_source
     )
 
+
     if not chunks:
+
         return (
-            "Please upload and process your study material first.",
+            "I could not find relevant information "
+            "in the selected study material.",
             []
         )
 
+
     context_parts = []
 
-    for index, chunk in enumerate(chunks, start=1):
+
+    for index, chunk in enumerate(
+        chunks,
+        start=1
+    ):
+
         context_parts.append(
             f"""
-[Source {index}]
-File: {chunk['source']}
-Page: {chunk['page']}
+SOURCE {index}
 
+Document:
+{chunk['source']}
+
+Page:
+{chunk['page']}
+
+Content:
 {chunk['text']}
 """
         )
 
-    context = "\n\n".join(context_parts)
+
+    context = "\n\n".join(
+        context_parts
+    )
+
+
+    # -------------------------------------
+    # RECENT CHAT
+    # -------------------------------------
 
     history_text = ""
 
     if chat_history:
-        recent_history = chat_history[-6:]
 
-        for message in recent_history:
+        for message in (
+            chat_history[-6:]
+        ):
+
             history_text += (
                 f"{message['role']}: "
                 f"{message['content']}\n"
             )
 
+
     prompt = f"""
-You are EduMentor AI, a helpful study assistant.
+You are EduMentor AI.
 
-Answer the student's question using ONLY the
-study material provided below.
+Answer the student's question using the
+retrieved study material.
 
-Rules:
-1. Use simple language.
-2. Do not invent information.
-3. If the answer is not in the material, say:
-"I could not find this information in the uploaded study material."
-4. Mention relevant source filename and page.
-5. Use conversation history only for follow-up context.
+RETRIEVED STUDY MATERIAL:
 
-Recent conversation:
-{history_text}
-
-Study material:
 {context}
 
-Student question:
+RECENT CHAT:
+
+{history_text}
+
+STUDENT QUESTION:
+
 {question}
 
-Answer:
+RULES:
+
+1. Use the retrieved material as the
+   primary source.
+2. Do not invent unsupported facts.
+3. Explain clearly in student-friendly
+   language.
+4. Mention relevant document/page numbers
+   when useful.
+5. Use chat history only to understand
+   follow-up questions.
 """
+
 
     answer = ask_ollama(
         prompt=prompt,
         model=model
     )
 
-    return answer, chunks
 
-
-def get_document_content(source=None, max_chars=14000):
-    collection = get_collection()
-
-    if collection.count() == 0:
-        return ""
-
-    if source and source != "All Documents":
-        results = collection.get(
-            where={"source": source},
-            include=["documents", "metadatas"]
-        )
-    else:
-        results = collection.get(
-            include=["documents", "metadatas"]
-        )
-
-    items = []
-
-    for document, metadata in zip(
-        results["documents"],
-        results["metadatas"]
-    ):
-        items.append(
-            (
-                metadata.get("source", ""),
-                int(metadata.get("page", 0)),
-                document
-            )
-        )
-
-    items.sort(
-        key=lambda x: (
-            x[0],
-            x[1]
-        )
+    return (
+        answer,
+        chunks
     )
-
-    combined = ""
-
-    for source_name, page, text in items:
-        section = (
-            f"\n\nFile: {source_name}\n"
-            f"Page: {page}\n{text}"
-        )
-
-        if len(combined) + len(section) > max_chars:
-            break
-
-        combined += section
-
-    return combined

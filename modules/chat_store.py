@@ -4,23 +4,39 @@ from config import CHAT_HISTORY_FILE
 
 
 def load_chat_history():
+
     if not CHAT_HISTORY_FILE.exists():
         return []
 
     try:
+
         with open(
             CHAT_HISTORY_FILE,
             "r",
             encoding="utf-8"
         ) as file:
-            return json.load(file)
 
-    except Exception:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return data
+
+        return []
+
+    except (
+        json.JSONDecodeError,
+        OSError
+    ):
+
         return []
 
 
-def save_chat_history(messages):
+def save_chat_history(
+    messages
+):
+
     CHAT_HISTORY_FILE.parent.mkdir(
+        parents=True,
         exist_ok=True
     )
 
@@ -29,13 +45,32 @@ def save_chat_history(messages):
         "w",
         encoding="utf-8"
     ) as file:
+
         json.dump(
             messages,
             file,
-            indent=2,
-            ensure_ascii=False
+            ensure_ascii=False,
+            indent=2
         )
 
 
 def clear_chat_history():
-    save_chat_history([])
+
+    if CHAT_HISTORY_FILE.exists():
+
+        try:
+
+            CHAT_HISTORY_FILE.unlink()
+
+        except OSError:
+
+            with open(
+                CHAT_HISTORY_FILE,
+                "w",
+                encoding="utf-8"
+            ) as file:
+
+                json.dump(
+                    [],
+                    file
+                )

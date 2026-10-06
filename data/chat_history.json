@@ -1,1 +1,10 @@
-[]
+[
+  {
+    "role": "user",
+    "content": "what is the cgpa in the given pdf?"
+  },
+  {
+    "role": "assistant",
+    "content": "The CGPA is 9.75. \n\nSource: File: Mogili Ashwitha resume.pdf, Page: 1 and Page: 2"
+  }
+]
